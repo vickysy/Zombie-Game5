@@ -127,9 +127,28 @@ const uiHp = document.getElementById('ui-hp');
 const uiRound = document.getElementById('ui-round');
 const uiZombies = document.getElementById('ui-zombies');
 const uiWeapon = document.getElementById('ui-weapon');
+const uiStars = document.getElementById('ui-stars');
+const uiObjective = document.getElementById('ui-objective');
 const blocker = document.getElementById('blocker');
 const upgradeModal = document.getElementById('upgrade-modal');
 const uiContainer = document.getElementById('ui-container');
+
+// Saved Stars
+let savedStars = parseInt(localStorage.getItem('zombie_game_stars') || '0');
+if (uiStars) uiStars.innerText = savedStars;
+
+// Hard reset shortcut
+window.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'r') {
+        localStorage.setItem('zombie_game_stars', '0');
+        alert("星星已重置为 0，页面将重新加载");
+        // Browser will naturally reload due to Cmd+Shift+R
+    }
+});
+
+// Car for City Terrain
+let carMesh = null;
+let carHitbox = null;
 
 // Menus
 const mainMenu = document.getElementById('main-menu');
@@ -318,6 +337,55 @@ function updateLobbyPlayers() {
     });
 }
 
+function updateObjectiveUI() {
+    if (!uiObjective) return;
+    if (currentTerrain === 'city') {
+        uiObjective.innerText = '寻找汽车并按 E 逃离';
+    } else if (currentTerrain === 'grass') {
+        uiObjective.innerText = '穿过草原到达城市边界 (地图边缘)';
+    } else if (currentTerrain === 'mountain') {
+        uiObjective.innerText = '击杀 30 只僵尸并下山 (地图边缘)';
+    } else {
+        uiObjective.innerText = '生存';
+    }
+}
+
+function checkEscapeCondition() {
+    if (!isGameStarted) return;
+    
+    const p = controls.getObject().position;
+    
+    if (currentTerrain === 'grass') {
+        // Run to the edge of the map (z or x near MAP_SIZE)
+        const i = Math.floor((p.x + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        const j = Math.floor((p.z + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        if (i >= MAP_SIZE - 3 || j >= MAP_SIZE - 3 || i <= 2 || j <= 2) {
+            triggerWin("成功穿过草原到达城市！");
+        }
+    } else if (currentTerrain === 'mountain') {
+        // Must kill 30 zombies and reach edge
+        const i = Math.floor((p.x + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        const j = Math.floor((p.z + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        if (zombiesKilled >= 30 && (i >= MAP_SIZE - 3 || j >= MAP_SIZE - 3 || i <= 2 || j <= 2)) {
+            triggerWin("成功下山并消灭了僵尸！");
+        }
+    }
+}
+
+function triggerWin(msg) {
+    isGameStarted = false;
+    controls.unlock();
+    
+    savedStars++;
+    localStorage.setItem('zombie_game_stars', savedStars.toString());
+    if (uiStars) uiStars.innerText = savedStars;
+    
+    setTimeout(() => {
+        alert(msg + "\n获得 1 颗星星！\n当前总星星数: " + savedStars);
+        location.reload();
+    }, 100);
+}
+
 function startGame(mode) {
     gameMode = mode;
     isGameStarted = true;
@@ -355,6 +423,7 @@ function startGame(mode) {
     if (mode === 'zombies' || mode === 'bots' || isHost) {
         generateMap();
         startRound();
+        updateObjectiveUI();
         
         // If host, tell clients to start and send map
         if (isHost && connections.length > 0) {
@@ -525,6 +594,7 @@ function setupConnection(conn) {
                 
                 startGame(data.mode);
                 startRound(); // Client also needs to initialize round logic
+                updateObjectiveUI(); // Sync objective UI on client
                 
                 // Delay sending position until controls are fully initialized and camera is ready
                 setTimeout(() => {
@@ -759,6 +829,19 @@ function init() {
     document.addEventListener('keyup', onKeyUp);
     document.addEventListener('mousedown', onMouseDown);
     
+    // Check for E key interaction
+    document.addEventListener('keydown', (e) => {
+        if (!isGameStarted || !controls.isLocked) return;
+        if (e.code === 'KeyE' && currentTerrain === 'city' && carMesh && carHitbox) {
+            const p = controls.getObject().position;
+            // Expand car hitbox slightly for interaction range
+            const interactBox = carHitbox.clone().expandByScalar(BLOCK_SIZE * 2);
+            if (interactBox.containsPoint(p)) {
+                triggerWin("您成功上车并逃离了城市！");
+            }
+        }
+    });
+    
     // Weapon UI setup
     setupWeaponView();
 
@@ -838,25 +921,59 @@ function generateMap() {
         }
     }
 
-    // Simple random walk for maze carving
-    let currX = Math.floor(MAP_SIZE / 2);
-    let currZ = Math.floor(MAP_SIZE / 2);
-    mapGrid[currX][currZ] = 0;
+    if (currentTerrain === 'city') {
+        // Grid streets
+        for (let i = 0; i < MAP_SIZE; i++) {
+            for (let j = 0; j < MAP_SIZE; j++) {
+                if (i % 6 === 0 || i % 6 === 1 || j % 6 === 0 || j % 6 === 1) {
+                    mapGrid[i][j] = 0;
+                } else {
+                    mapGrid[i][j] = 1;
+                }
+            }
+        }
+        // Ensure boundaries are solid walls
+        for (let i = 0; i < MAP_SIZE; i++) {
+            mapGrid[i][0] = 1; mapGrid[i][MAP_SIZE - 1] = 1;
+            mapGrid[0][i] = 1; mapGrid[MAP_SIZE - 1][i] = 1;
+        }
+    } else if (currentTerrain === 'grass') {
+        // Mostly open fields with sparse walls
+        for (let i = 0; i < MAP_SIZE; i++) {
+            for (let j = 0; j < MAP_SIZE; j++) {
+                mapGrid[i][j] = Math.random() > 0.9 ? 1 : 0;
+            }
+        }
+        // Add a line of walls at the very edge (City Border)
+        for (let j = 0; j < MAP_SIZE; j++) {
+            mapGrid[MAP_SIZE - 2][j] = 1; // Visual city wall
+        }
+        // Ensure boundaries are solid walls
+        for (let i = 0; i < MAP_SIZE; i++) {
+            mapGrid[i][0] = 1; mapGrid[i][MAP_SIZE - 1] = 1;
+            mapGrid[0][i] = 1; mapGrid[MAP_SIZE - 1][i] = 1;
+        }
+    } else {
+        // Default random walk for mountain/maze
+        let currX = Math.floor(MAP_SIZE / 2);
+        let currZ = Math.floor(MAP_SIZE / 2);
+        mapGrid[currX][currZ] = 0;
 
-    const maxSteps = MAP_SIZE * MAP_SIZE * 0.4;
-    for (let step = 0; step < maxSteps; step++) {
-        const dirs = [
-            {x: 0, z: 1}, {x: 0, z: -1}, {x: 1, z: 0}, {x: -1, z: 0}
-        ];
-        const dir = dirs[Math.floor(Math.random() * dirs.length)];
-        
-        let nextX = currX + dir.x;
-        let nextZ = currZ + dir.z;
-        
-        if (nextX > 0 && nextX < MAP_SIZE - 1 && nextZ > 0 && nextZ < MAP_SIZE - 1) {
-            currX = nextX;
-            currZ = nextZ;
-            mapGrid[currX][currZ] = 0;
+        const maxSteps = MAP_SIZE * MAP_SIZE * 0.4;
+        for (let step = 0; step < maxSteps; step++) {
+            const dirs = [
+                {x: 0, z: 1}, {x: 0, z: -1}, {x: 1, z: 0}, {x: -1, z: 0}
+            ];
+            const dir = dirs[Math.floor(Math.random() * dirs.length)];
+            
+            let nextX = currX + dir.x;
+            let nextZ = currZ + dir.z;
+            
+            if (nextX > 0 && nextX < MAP_SIZE - 1 && nextZ > 0 && nextZ < MAP_SIZE - 1) {
+                currX = nextX;
+                currZ = nextZ;
+                mapGrid[currX][currZ] = 0;
+            }
         }
     }
 
@@ -940,6 +1057,40 @@ function buildMapMeshes() {
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
     mapGroup.add(floor);
+
+    // Build car if city
+    if (carMesh) {
+        mapGroup.remove(carMesh);
+        carMesh = null;
+    }
+    
+    if (currentTerrain === 'city') {
+        const carGeo = new THREE.BoxGeometry(BLOCK_SIZE * 1.5, BLOCK_SIZE * 0.8, BLOCK_SIZE * 3);
+        const carMat = new THREE.MeshStandardMaterial({ color: 0xffaa00, roughness: 0.5, metalness: 0.8 });
+        carMesh = new THREE.Mesh(carGeo, carMat);
+        
+        // Place car near the fixed spawn pos but slightly offset
+        carMesh.position.set(fixedSpawnPos.x - BLOCK_SIZE*2, BLOCK_SIZE*0.4, fixedSpawnPos.z - BLOCK_SIZE*2);
+        
+        // Add wheels
+        const wheelGeo = new THREE.CylinderGeometry(BLOCK_SIZE*0.4, BLOCK_SIZE*0.4, BLOCK_SIZE*1.6, 16);
+        const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+        const frontWheels = new THREE.Mesh(wheelGeo, wheelMat);
+        frontWheels.rotation.z = Math.PI / 2;
+        frontWheels.position.set(0, -BLOCK_SIZE*0.2, BLOCK_SIZE);
+        carMesh.add(frontWheels);
+        
+        const backWheels = new THREE.Mesh(wheelGeo, wheelMat);
+        backWheels.rotation.z = Math.PI / 2;
+        backWheels.position.set(0, -BLOCK_SIZE*0.2, -BLOCK_SIZE);
+        carMesh.add(backWheels);
+        
+        carMesh.castShadow = true;
+        carMesh.receiveShadow = true;
+        mapGroup.add(carMesh);
+        
+        carHitbox = new THREE.Box3().setFromObject(carMesh);
+    }
 
     // Move player to a safe start spot
     controls.getObject().position.set(0, BLOCK_SIZE * 0.8, 0);
@@ -1582,7 +1733,10 @@ function animate() {
     if (delta > 0.1) delta = 0.1;
 
     if (isGameStarted && controls.isLocked === true) {
-            // Player Movement
+        // Check escape conditions constantly
+        checkEscapeCondition();
+        
+        // Player Movement
         direction.z = Number(moveForward) - Number(moveBackward);
         direction.x = Number(moveRight) - Number(moveLeft);
         direction.normalize();
