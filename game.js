@@ -31,6 +31,7 @@ let isUpgrading = false;
 let isGameStarted = false;
 let isHost = false;
 let mapGrid = [];
+let heightMap = [];
 let fixedSpawnPos = null;
 let currentTerrain = 'city';
 let lastZombieSpawnTime = 0;
@@ -40,6 +41,7 @@ let enemyIdCounter = 0;
 
 let sniperRangeBase = 10;
 let rangeUpgradeCount = 0;
+let lastFireTime = 0;
 
 // PeerJS Networking
 let peer = null;
@@ -414,6 +416,11 @@ function startGame(mode) {
     zombiesAlive = 0;
     bullets.forEach(b => scene.remove(b.mesh));
     bullets = [];
+    
+    // Assign a random starting weapon
+    const weapons = ['sniper', 'shotgun', 'smg', 'flamethrower', 'gatling'];
+    const randomWeapon = weapons[Math.floor(Math.random() * weapons.length)];
+    createGun(randomWeapon);
     
     // Reset player pos
     controls.getObject().position.set(0, BLOCK_SIZE * 0.8, 0);
@@ -916,8 +923,10 @@ function generateMap() {
     // Initialize with walls
     for (let i = 0; i < MAP_SIZE; i++) {
         mapGrid[i] = [];
+        heightMap[i] = [];
         for (let j = 0; j < MAP_SIZE; j++) {
             mapGrid[i][j] = 1;
+            heightMap[i][j] = 0;
         }
     }
 
@@ -941,7 +950,7 @@ function generateMap() {
         // Mostly open fields with sparse walls
         for (let i = 0; i < MAP_SIZE; i++) {
             for (let j = 0; j < MAP_SIZE; j++) {
-                mapGrid[i][j] = Math.random() > 0.9 ? 1 : 0;
+                mapGrid[i][j] = Math.random() > 0.95 ? 1 : 0;
             }
         }
         // Add a line of walls at the very edge (City Border)
@@ -953,8 +962,27 @@ function generateMap() {
             mapGrid[i][0] = 1; mapGrid[i][MAP_SIZE - 1] = 1;
             mapGrid[0][i] = 1; mapGrid[MAP_SIZE - 1][i] = 1;
         }
+    } else if (currentTerrain === 'mountain') {
+        // Generate stepped mountain heightmap
+        for (let i = 0; i < MAP_SIZE; i++) {
+            for (let j = 0; j < MAP_SIZE; j++) {
+                const dx = i - MAP_SIZE / 2;
+                const dz = j - MAP_SIZE / 2;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                const h = Math.max(0, Math.floor(10 - dist * 0.25)); // peak at center
+                heightMap[i][j] = h;
+                
+                // Add some random rocks/walls on the mountain, but mostly open
+                mapGrid[i][j] = Math.random() > 0.95 ? 1 : 0;
+            }
+        }
+        // Ensure boundaries are solid walls to prevent falling off
+        for (let i = 0; i < MAP_SIZE; i++) {
+            mapGrid[i][0] = 1; mapGrid[i][MAP_SIZE - 1] = 1;
+            mapGrid[0][i] = 1; mapGrid[MAP_SIZE - 1][i] = 1;
+        }
     } else {
-        // Default random walk for mountain/maze
+        // Default random walk for mountain/maze (now just default maze)
         let currX = Math.floor(MAP_SIZE / 2);
         let currZ = Math.floor(MAP_SIZE / 2);
         mapGrid[currX][currZ] = 0;
@@ -1032,19 +1060,51 @@ function buildMapMeshes() {
     const wallTex = createGridTexture(wallColor, wallLineColor, true);
     const wallMat = new THREE.MeshStandardMaterial({ map: wallTex, roughness: 1.0 });
     
+    // For Mountain blocks
+    const mGeo = new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+    const mMat = new THREE.MeshStandardMaterial({ color: 0xdddddd, roughness: 0.9 });
+    let mCount = 0;
+    if (currentTerrain === 'mountain') {
+        for(let i=0;i<MAP_SIZE;i++) for(let j=0;j<MAP_SIZE;j++) mCount += heightMap[i][j];
+    }
+    const mInstanced = currentTerrain === 'mountain' ? new THREE.InstancedMesh(mGeo, mMat, mCount) : null;
+    let mIdx = 0;
+    const dummy = new THREE.Object3D();
+
     for (let i = 0; i < MAP_SIZE; i++) {
         for (let j = 0; j < MAP_SIZE; j++) {
+            const h = heightMap[i][j];
+            
+            // Build mountain blocks
+            if (currentTerrain === 'mountain' && h > 0) {
+                for (let y = 0; y < h; y++) {
+                    dummy.position.set(
+                        (i - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2, 
+                        y * BLOCK_SIZE + BLOCK_SIZE / 2, 
+                        (j - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2
+                    );
+                    dummy.updateMatrix();
+                    mInstanced.setMatrixAt(mIdx++, dummy.matrix);
+                }
+            }
+
             if (mapGrid[i] && mapGrid[i][j] === 1) {
                 const wall = new THREE.Mesh(wallGeo, wallMat);
                 // Position relative to center
                 wall.position.x = (i - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2;
                 wall.position.z = (j - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2;
-                wall.position.y = BLOCK_SIZE;
+                // Place wall on top of the terrain height
+                wall.position.y = (h * BLOCK_SIZE) + BLOCK_SIZE;
                 wall.castShadow = true;
                 wall.receiveShadow = true;
                 mapGroup.add(wall);
             }
         }
+    }
+    if (mInstanced) {
+        mInstanced.castShadow = true;
+        mInstanced.receiveShadow = true;
+        mapGroup.add(mInstanced);
     }
 
     const floorGeo = new THREE.PlaneGeometry(MAP_SIZE * BLOCK_SIZE, MAP_SIZE * BLOCK_SIZE);
@@ -1092,12 +1152,43 @@ function buildMapMeshes() {
         carHitbox = new THREE.Box3().setFromObject(carMesh);
     }
 
+    if (currentTerrain === 'grass') {
+        // Add trees
+        const treeGeo = new THREE.CylinderGeometry(BLOCK_SIZE * 0.2, BLOCK_SIZE * 0.2, BLOCK_SIZE * 2);
+        const treeMat = new THREE.MeshStandardMaterial({ color: 0x8b4513, roughness: 0.9 });
+        const leafGeo = new THREE.SphereGeometry(BLOCK_SIZE * 1.5, 8, 8);
+        const leafMat = new THREE.MeshStandardMaterial({ color: 0x228b22, roughness: 0.8 });
+        
+        for (let i = 0; i < 50; i++) {
+            let tx = Math.floor(Math.random() * (MAP_SIZE - 4)) + 2;
+            let tz = Math.floor(Math.random() * (MAP_SIZE - 4)) + 2;
+            if (mapGrid[tx][tz] === 0) {
+                const treeGroup = new THREE.Group();
+                const trunk = new THREE.Mesh(treeGeo, treeMat);
+                trunk.position.y = BLOCK_SIZE;
+                const leaves = new THREE.Mesh(leafGeo, leafMat);
+                leaves.position.y = BLOCK_SIZE * 2.5;
+                
+                trunk.castShadow = true; leaves.castShadow = true;
+                
+                treeGroup.add(trunk);
+                treeGroup.add(leaves);
+                treeGroup.position.set(
+                    (tx - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2,
+                    0,
+                    (tz - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2
+                );
+                mapGroup.add(treeGroup);
+            }
+        }
+    }
+
     // Move player to a safe start spot
     controls.getObject().position.set(0, BLOCK_SIZE * 0.8, 0);
 }
 
 function getSafeSpawnPos() {
-    let x, z;
+    let x, z, y;
     let safe = false;
     while (!safe) {
         let i = Math.floor(Math.random() * (MAP_SIZE - 2)) + 1;
@@ -1105,6 +1196,8 @@ function getSafeSpawnPos() {
         if (mapGrid[i][j] === 0) {
             x = (i - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2;
             z = (j - MAP_SIZE / 2) * BLOCK_SIZE + BLOCK_SIZE / 2;
+            y = (heightMap[i] && heightMap[i][j]) ? heightMap[i][j] * BLOCK_SIZE : 0;
+            
             // Ensure not too close to player
             const px = controls.getObject().position.x;
             const pz = controls.getObject().position.z;
@@ -1114,7 +1207,7 @@ function getSafeSpawnPos() {
             }
         }
     }
-    return { x, z };
+    return { x, y, z };
 }
 
 function startRound() {
@@ -1169,7 +1262,7 @@ function spawnEnemy() {
     group.add(rightEye);
     
     const pos = getSafeSpawnPos();
-    group.position.set(pos.x, BLOCK_SIZE * 0.9, pos.z);
+    group.position.set(pos.x, pos.y + BLOCK_SIZE * 0.9, pos.z);
     
     const eId = isHost ? enemyIdCounter++ : -1;
 
@@ -1341,6 +1434,8 @@ function createGun(type) {
     if (type === 'shotgun') color = 0x5c4033;
     if (type === 'flamethrower') color = 0xcc4400;
     if (type === 'smg') color = 0x444444;
+    if (type === 'gatling') color = 0x555555;
+    
     const barrelMat = new THREE.MeshStandardMaterial({ color: color, roughness: 1.0 });
     const barrel = new THREE.Mesh(barrelGeo, barrelMat);
     barrel.position.z = type === 'sniper' ? -0.5 : -0.2;
@@ -1354,6 +1449,14 @@ function createGun(type) {
     body.position.z = 0.1;
     gunGroup.add(body);
     
+    // Extra visual for Gatling (multiple barrels look)
+    if (type === 'gatling') {
+        const extraBarrelGeo = new THREE.BoxGeometry(0.15, 0.15, 0.7);
+        const extraBarrel = new THREE.Mesh(extraBarrelGeo, barrelMat);
+        extraBarrel.position.z = -0.15;
+        gunGroup.add(extraBarrel);
+    }
+    
     // Front sight or Scope
     if (type === 'sniper') {
         const scopeGeo = new THREE.BoxGeometry(0.06, 0.06, 0.4);
@@ -1362,7 +1465,7 @@ function createGun(type) {
         scope.position.y = 0.08;
         scope.position.z = -0.1;
         gunGroup.add(scope);
-    } else {
+    } else if (type !== 'gatling') {
         const sightGeo = new THREE.BoxGeometry(0.02, 0.05, 0.05);
         const sightMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
         const sight = new THREE.Mesh(sightGeo, sightMat);
@@ -1382,6 +1485,7 @@ function createGun(type) {
     if(type === 'shotgun') weaponName = '散弹枪';
     if(type === 'flamethrower') weaponName = '喷火枪';
     if(type === 'smg') weaponName = '连发枪';
+    if(type === 'gatling') weaponName = '加特林';
     uiWeapon.innerText = weaponName;
 }
 
@@ -1486,6 +1590,16 @@ function attack(type) {
     }
 
     if (type === 'gun') {
+        const now = performance.now();
+        let fireDelay = 500; // default 0.5s
+        if (currentWeapon === 'shotgun') fireDelay = 800;
+        if (currentWeapon === 'smg') fireDelay = 150;
+        if (currentWeapon === 'flamethrower') fireDelay = 50;
+        if (currentWeapon === 'gatling') fireDelay = 30; // Very fast
+        
+        if (now - lastFireTime < fireDelay) return; // Cooldown
+        lastFireTime = now;
+
         createBullet();
         playShootSound();
     }
@@ -1504,49 +1618,81 @@ function attack(type) {
         zombieObjects.push(...z.mesh.children);
     });
 
-    const intersects = raycaster.intersectObjects(zombieObjects);
+    const enemyIntersects = raycaster.intersectObjects(zombieObjects);
+    const wallIntersects = raycaster.intersectObjects(mapGroup.children, true);
     
-    if (intersects.length > 0) {
-        const hit = intersects[0];
-        if (hit.distance <= maxDist) {
-            // Find which enemy group the hit object belongs to
-            const zombieIndex = enemies.findIndex(z => z.mesh === hit.object.parent);
-            if (zombieIndex !== -1) {
-                const e = enemies[zombieIndex];
-                if (e.isFriendly) return; // Don't hurt friendly bots
-                
-                let damage = 10; // Default 10 dmg for sword and sniper (2 hits to kill 20 HP)
-                if (currentWeapon === 'shotgun') damage = 25;
-                if (currentWeapon === 'smg') damage = 8;
-                if (currentWeapon === 'flamethrower') damage = 5;
-                
-                enemies[zombieIndex].hp -= damage;
-                playHitSound();
-                
-                // Flash red on the hit object (body or eye)
-                const originalColor = hit.object.material.color ? hit.object.material.color.getHex() : null;
-                if (hit.object.material.color) {
-                    hit.object.material.color.setHex(0xff0000);
-                    setTimeout(() => {
-                        if (hit.object && hit.object.material && originalColor !== null) {
-                            hit.object.material.color.setHex(originalColor);
-                        }
-                    }, 100);
-                }
+    let closestEnemyHit = enemyIntersects.length > 0 ? enemyIntersects[0] : null;
+    let closestWallHit = wallIntersects.length > 0 ? wallIntersects[0] : null;
+    
+    if (closestWallHit && closestWallHit.distance > maxDist) closestWallHit = null;
+    if (closestEnemyHit && closestEnemyHit.distance > maxDist) closestEnemyHit = null;
 
-                if (enemies[zombieIndex].hp <= 0) {
-                    killZombie(zombieIndex);
-                }
-                
-                // If multiplayer client, tell host we hit it
-                if (!isHost && gameMode.startsWith('multiplayer')) {
-                    if (peer && connections.length > 0) {
-                        connections[0].send({ type: 'hit_enemy', id: enemies[zombieIndex].id, damage: damage });
+    if (type === 'gun' && closestWallHit) {
+        // If wall is closer than enemy, or no enemy hit, hit the wall
+        if (!closestEnemyHit || closestWallHit.distance < closestEnemyHit.distance) {
+            createBulletHole(closestWallHit.point, closestWallHit.face ? closestWallHit.face.normal : null);
+            return; // Wall blocked the shot
+        }
+    }
+
+    if (closestEnemyHit) {
+        const hit = closestEnemyHit;
+        // Find which enemy group the hit object belongs to
+        const zombieIndex = enemies.findIndex(z => z.mesh === hit.object.parent);
+        if (zombieIndex !== -1) {
+            const e = enemies[zombieIndex];
+            if (e.isFriendly) return; // Don't hurt friendly bots
+            
+            let damage = 10; // Default 10 dmg for sword and sniper (2 hits to kill 20 HP)
+            if (currentWeapon === 'shotgun') damage = 25;
+            if (currentWeapon === 'smg') damage = 8;
+            if (currentWeapon === 'flamethrower') damage = 5;
+            if (currentWeapon === 'gatling') damage = 4;
+            
+            enemies[zombieIndex].hp -= damage;
+            playHitSound();
+            
+            // Flash red on the hit object (body or eye)
+            const originalColor = hit.object.material.color ? hit.object.material.color.getHex() : null;
+            if (hit.object.material.color) {
+                hit.object.material.color.setHex(0xff0000);
+                setTimeout(() => {
+                    if (hit.object && hit.object.material && originalColor !== null) {
+                        hit.object.material.color.setHex(originalColor);
                     }
+                }, 100);
+            }
+
+            if (enemies[zombieIndex].hp <= 0) {
+                killZombie(zombieIndex);
+            }
+            
+            // If multiplayer client, tell host we hit it
+            if (!isHost && gameMode.startsWith('multiplayer')) {
+                if (peer && connections.length > 0) {
+                    connections[0].send({ type: 'hit_enemy', id: enemies[zombieIndex].id, damage: damage });
                 }
             }
         }
     }
+}
+
+function createBulletHole(point, normal) {
+    if (!normal) return;
+    const holeGeo = new THREE.PlaneGeometry(0.2, 0.2);
+    const holeMat = new THREE.MeshBasicMaterial({ 
+        color: 0x000000, 
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
+        transparent: true,
+        opacity: 0.9
+    });
+    const hole = new THREE.Mesh(holeGeo, holeMat);
+    hole.position.copy(point);
+    hole.position.add(normal.clone().multiplyScalar(0.01));
+    hole.lookAt(point.clone().add(normal));
+    mapGroup.add(hole);
 }
 
 function killZombie(index) {
@@ -1774,19 +1920,32 @@ function animate() {
 
         pos.y += (velocity.y * delta);
 
-        if (pos.y < BLOCK_SIZE * 0.8) {
+        // Calculate ground height below player based on heightMap
+        const iGrid = Math.floor((pos.x + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        const jGrid = Math.floor((pos.z + (MAP_SIZE / 2) * BLOCK_SIZE) / BLOCK_SIZE);
+        let groundHeight = 0;
+        if (iGrid >= 0 && iGrid < MAP_SIZE && jGrid >= 0 && jGrid < MAP_SIZE) {
+            if (heightMap[iGrid] && heightMap[iGrid][jGrid]) {
+                groundHeight = heightMap[iGrid][jGrid] * BLOCK_SIZE;
+            }
+        }
+        
+        const minPlayerY = groundHeight + BLOCK_SIZE * 0.8;
+
+        if (pos.y < minPlayerY) {
             velocity.y = 0;
-            pos.y = BLOCK_SIZE * 0.8;
+            pos.y = minPlayerY;
             canJump = true;
         }
 
         // Continuous shooting
         if (isShooting && hasGun) {
             let fireRate = 0.5; // default
-            if (currentWeapon === 'sniper') fireRate = 0.5; // Changed back to 0.5s per shot
+            if (currentWeapon === 'sniper') fireRate = 0.5; 
             if (currentWeapon === 'smg') fireRate = 0.1;
             if (currentWeapon === 'flamethrower') fireRate = 0.05;
             if (currentWeapon === 'shotgun') fireRate = 0.8;
+            if (currentWeapon === 'gatling') fireRate = 0.03; // Insanely fast
             
             if (time - lastShootTime > fireRate * 1000) {
                 attack('gun');
